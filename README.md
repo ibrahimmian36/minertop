@@ -12,9 +12,9 @@ The headline feature is **hidden miner detection**: when a process with a name l
 
 It's built on [**yeet**](https://yeet.cx), a Linux runtime that makes a kernel-side BPF program, a per-tick render loop, and a JS state model feel like one program.
 
-<!-- Demo GIF: vhs assets/minertop.tape on a Linux box with yeet
-     and a miner running, then add:
-     ![minertop](assets/minertop.gif) -->
+<p align="center">
+  <img src="assets/minertop.gif" alt="minertop demo" width="820">
+</p>
 
 ---
 
