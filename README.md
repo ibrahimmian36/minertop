@@ -3,7 +3,7 @@
 **Crypto-mining traffic detector for Linux** — in ten seconds, see who on your box is talking to a mining pool. Including the things lying about their name.
 
 ```
-$ sudo yeet run https://github.com/ibrahimmian36/minertop
+$ yeet run https://github.com/ibrahimmian36/minertop
 ```
 
 minertop catches the miner. No agents, no signature database, no proxy. The kernel sees every TCP connection; minertop classifies the destination port against a database of known mining pools and ranks processes by how confident the case against them is.
@@ -97,7 +97,7 @@ The kernel side is **identical to bytetop's** — same CO-RE-compliant hooks, sa
 
 - Linux ≥ 5.5 (for `fentry` and `tp_btf`); Debian 13, Ubuntu 22.04+, Fedora 36+, recent Arch all fine
 - Kernel BTF: `CONFIG_DEBUG_INFO_BTF=y`, default on current Arch, Fedora, Ubuntu, and Debian 12+
-- `CAP_BPF` + `CAP_PERFMON` (typically root)
+- `CAP_BPF` + `CAP_PERFMON` — yeet handles this for you
 - `clang` and `bpftool` to build the BPF object — `yeet run` does this for you on first launch
 
 ## Build it from a clone
@@ -106,7 +106,7 @@ The kernel side is **identical to bytetop's** — same CO-RE-compliant hooks, sa
 git clone https://github.com/ibrahimmian36/minertop
 cd minertop
 make                    # builds bin/minertop.bpf.o
-sudo yeet main.js       # run from source
+yeet run main.js        # run from source
 ```
 
 `make clean` removes `bin/`. `make distclean` also removes the generated `include/vmlinux.h`.
