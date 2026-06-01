@@ -12,7 +12,7 @@ minertop catches the [Kinsing](https://en.wikipedia.org/wiki/Kinsing) family of 
 
 It's built on [**yeet**](https://yeet.cx), a Linux runtime that makes a kernel-side BPF program, a per-tick render loop, and a JS state model feel like one program.
 
-<!-- Demo GIF: ![minertop](assets/minertop.gif) -->
+<p align="center"><img src="assets/minertop.gif" alt="minertop demo" width="820"></p>
 
 ---
 
