@@ -72,7 +72,36 @@ const alerts = new Map();
  * "family:addr-hex:port". Carries the inferred coin/proto. */
 const pools = new Map();
 
-function minerKey(pid, comm) { return pid + ":" + comm; }
+/* allDests: every destination observed during this scan, regardless of
+ * classification. Used only by audit mode (--audit) to compute "I saw
+ * N distinct destinations, M of them were mining pools". Has no TTL —
+ * audit windows are short (60s default) and we want a complete count.
+ * The live dashboard never reads this map, so memory cost is paid
+ * only when the user opts into audit mode. */
+const allDests = new Map();
+
+function getAllDest(family, daddr, dport, classification) {
+  let k = String(family) + "\x00";
+  for (let i = 0; i < 16; i++) k += daddr[i].toString(16).padStart(2, "0");
+  k += "\x00" + dport;
+  let d = allDests.get(k);
+  if (!d) {
+    const addrCopy = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) addrCopy[i] = daddr[i] | 0;
+    d = {
+      family, addr: addrCopy, port: dport,
+      classification,
+      bytes_tx: 0, bytes_rx: 0,
+      conn_count: 0,
+      first_seen: Date.now(),
+      last_seen:  Date.now(),
+    };
+    allDests.set(k, d);
+  }
+  return d;
+}
+
+function minerKey(pid, comm) { return pid + "\x00" + comm; }
 
 function getMiner(pid, comm, cls) {
   const key = minerKey(pid, comm);
@@ -214,6 +243,9 @@ export function onEvent(e) {
                     addrToHexStr(c.daddr), c.dport);
       }
     }
+    /* Track EVERY destination (not just mining) for audit mode. */
+    const d = getAllDest(c.family, c.daddr, c.dport, cls);
+    d.conn_count++; d.last_seen = now;
     pushFeed({
       ts: now, kind: "open", sk,
       family: c.family,
@@ -248,6 +280,9 @@ export function onEvent(e) {
         if (m.mimicry) recordAlert(c.pid, c.comm, cls, m.mimicry,
                                    addrToHexStr(c.daddr), c.dport);
       }
+      /* Always register destination for audit. */
+      const dStub = getAllDest(c.family, c.daddr, c.dport, cls);
+      dStub.conn_count++; dStub.last_seen = now;
     }
     c.bytes_tx += delta_tx;
     c.bytes_rx += delta_rx;
@@ -255,6 +290,10 @@ export function onEvent(e) {
 
     tickTotalTx += delta_tx; tickTotalRx += delta_rx;
     tot.bytes_tx_total += delta_tx; tot.bytes_rx_total += delta_rx;
+
+    /* Track every destination's bandwidth for audit mode. */
+    const d = getAllDest(c.family, c.daddr, c.dport, c.classification);
+    d.bytes_tx += delta_tx; d.bytes_rx += delta_rx; d.last_seen = now;
 
     if (c.classification === "mining" || c.classification === "stratum") {
       tickMiningTx += delta_tx; tickMiningRx += delta_rx;
@@ -291,6 +330,16 @@ export function onEvent(e) {
           m.bytes_tx += extraTx; m.bytes_rx += extraRx; m.last_seen = now;
           const p = getPool(c.family, c.daddr, c.dport);
           p.bytes_tx += extraTx; p.bytes_rx += extraRx; p.last_seen = now;
+          /* Also update the alert's byte counters if one was raised
+           * for this miner — without this, alerts under-report bytes
+           * that arrived only at the close-time reconciliation. */
+          if (m.mimicry) {
+            const a = alerts.get(minerKey(c.pid, c.comm));
+            if (a) {
+              a.bytes_tx += extraTx; a.bytes_rx += extraRx;
+              a.last_seen = now;
+            }
+          }
         }
       }
       c.closed = now;
@@ -418,5 +467,154 @@ export function counts() {
     pools:  pools.size,
     critical_alerts: critical,
     suspicious_alerts: suspicious,
+  };
+}
+
+/* ==================================================================== */
+/* Audit mode accessor                                                  */
+/* ==================================================================== */
+
+/* Returns a structured snapshot of everything the audit report needs.
+ * Pure data shape — no formatting decisions live here. audit.js owns
+ * the human and JSON rendering.
+ *
+ * Shape:
+ *   {
+ *     scan_duration_ms: number,
+ *     started_at: number (epoch ms),
+ *     total_events: number,
+ *     total_opens: number,
+ *     total_closes: number,
+ *     total_bytes_tx: number, total_bytes_rx: number,
+ *     mining_bytes_tx: number, mining_bytes_rx: number,
+ *     distinct_destinations: number,
+ *     mining_pool_hits: number,       // distinct mining-classified destinations
+ *     stratum_likely_hits: number,    // distinct stratum-likely destinations
+ *     crypto_p2p_hits: number,
+ *     miners: [ {pid, comm, classification, bytes_tx, bytes_rx, mimicry, ...} ],
+ *     pools: [ {addr, port, classification, info, bytes_tx, bytes_rx, ...} ],
+ *     alerts: [ {pid, comm, level, classification, pool_addr, pool_port, ...} ],
+ *     top_destinations: [ {addr, port, family, classification, bytes_tx, bytes_rx} ],
+ *     critical_alerts: number,
+ *     suspicious_alerts: number,
+ *     verdict: "CRITICAL" | "MINING" | "SUSPICIOUS" | "CLEAN",
+ *   }
+ */
+export function auditSnapshot() {
+  const now = Date.now();
+
+  let mining_pool_hits = 0;
+  let stratum_likely_hits = 0;
+  let crypto_p2p_hits = 0;
+  for (const d of allDests.values()) {
+    if (d.classification === "mining")     mining_pool_hits++;
+    else if (d.classification === "stratum")    stratum_likely_hits++;
+    else if (d.classification === "crypto-p2p") crypto_p2p_hits++;
+  }
+
+  /* Top destinations by total bandwidth across the scan window. */
+  const dests = [];
+  for (const d of allDests.values()) {
+    dests.push({
+      family: d.family,
+      addr: d.addr,
+      port: d.port,
+      classification: d.classification,
+      bytes_tx: d.bytes_tx,
+      bytes_rx: d.bytes_rx,
+      total_bytes: d.bytes_tx + d.bytes_rx,
+      conn_count: d.conn_count,
+    });
+  }
+  dests.sort((a, b) => b.total_bytes - a.total_bytes);
+
+  /* Aggregate miners + alerts + pools — copy what audit.js needs.
+   * We intentionally don't expose internal Maps; the snapshot is a
+   * one-shot read meant for printing. */
+  const minerList = [];
+  for (const m of miners.values()) {
+    minerList.push({
+      pid: m.pid,
+      comm: m.comm,
+      classification: m.classification,
+      bytes_tx: m.bytes_tx,
+      bytes_rx: m.bytes_rx,
+      conn_count: m.conn_count,
+      pool_count: m.pools.size,
+      mimicry: m.mimicry,
+      first_seen: m.first_seen,
+      last_seen: m.last_seen,
+    });
+  }
+
+  const poolList = [];
+  for (const p of pools.values()) {
+    poolList.push({
+      family: p.family,
+      addr: p.addr,
+      port: p.port,
+      classification: p.classification,
+      info: p.info,
+      bytes_tx: p.bytes_tx,
+      bytes_rx: p.bytes_rx,
+      conn_count: p.conn_count,
+      miner_count: p.miners.size,
+      first_seen: p.first_seen,
+      last_seen: p.last_seen,
+    });
+  }
+
+  const alertList = [];
+  let critical = 0, suspicious = 0;
+  for (const a of alerts.values()) {
+    alertList.push({
+      pid: a.pid,
+      comm: a.comm,
+      level: a.level,
+      classification: a.classification,
+      pool_addr: a.pool_addr,
+      pool_port: a.pool_port,
+      conn_count: a.conn_count,
+      bytes_tx: a.bytes_tx,
+      bytes_rx: a.bytes_rx,
+      first_seen: a.first_seen,
+      last_seen: a.last_seen,
+    });
+    if (a.level === "critical") critical++; else suspicious++;
+  }
+  alertList.sort((a, b) => {
+    /* critical first, then by recency */
+    if (a.level !== b.level) return a.level === "critical" ? -1 : 1;
+    return b.last_seen - a.last_seen;
+  });
+
+  /* Verdict ladder. The order matters — most severe wins. */
+  let verdict;
+  if (critical > 0)              verdict = "CRITICAL";
+  else if (minerList.length > 0) verdict = "MINING";
+  else if (suspicious > 0)       verdict = "SUSPICIOUS";
+  else                           verdict = "CLEAN";
+
+  return {
+    scan_duration_ms: now - startTime,
+    started_at: startTime,
+    total_events: tot.events,
+    total_opens: tot.opens,
+    total_closes: tot.closes,
+    total_bytes_tx: tot.bytes_tx_total,
+    total_bytes_rx: tot.bytes_rx_total,
+    mining_bytes_tx: tot.bytes_tx_mining,
+    mining_bytes_rx: tot.bytes_rx_mining,
+    distinct_destinations: allDests.size,
+    mining_pool_hits,
+    stratum_likely_hits,
+    crypto_p2p_hits,
+    miners: minerList,
+    pools: poolList,
+    alerts: alertList,
+    top_destinations: dests.slice(0, 20),
+    critical_alerts: critical,
+    suspicious_alerts: suspicious,
+    verdict,
   };
 }

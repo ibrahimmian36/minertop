@@ -1,24 +1,120 @@
 # minertop
 
-**Crypto-mining traffic detector for Linux** — in ten seconds, see who on your box is talking to a mining pool. Including the things lying about their name.
+**Behavioral hidden-cryptominer detector for Linux.** Scan your box; get a verdict in 60 seconds. No signature database, no agent, no cloud — just a kernel-side eBPF observer matching outbound TCP destinations against a mining-pool port database and flagging processes whose names lie about who they are.
 
 ```
-$ yeet run https://github.com/ibrahimmian36/minertop
+$ yeet run https://github.com/ibrahimmian36/minertop -- --audit
 ```
 
-minertop catches the miner. No agents, no signature database, no proxy. The kernel sees every TCP connection; minertop classifies the destination port against a database of known mining pools and ranks processes by how confident the case against them is.
+That command runs a one-shot scan and prints a structured report. If your box is clean, the verdict says so. If something's mining behind a spoofed process name, it tells you the PID, the pool, and the bytes.
 
-The headline feature is **hidden miner detection**: when a process with a name like `kworker/u4:2` or `systemd-resolved` is talking to a Monero pool, minertop flags it red. Real kernel threads can't open outbound TCP connections — anything claiming to be one and mining is malware that's lying about its identity.
+minertop catches the [Kinsing](https://en.wikipedia.org/wiki/Kinsing) family of cryptojackers — and anything else using the same pattern: a process renaming itself to `kworker/u4:2` or `systemd-resolved` while opening outbound TCP to a Monero pool. Real kernel threads can't open outbound TCP; if something claims to be one and is mining, it's malware.
 
 It's built on [**yeet**](https://yeet.cx), a Linux runtime that makes a kernel-side BPF program, a per-tick render loop, and a JS state model feel like one program.
 
-<p align="center">
-  <img src="assets/minertop.gif" alt="minertop demo" width="820">
-</p>
+<!-- Demo GIF: ![minertop](assets/minertop.gif) -->
 
 ---
 
-## What you actually see
+## Why this isn't a signature scanner
+
+Most "detect crypto miners" tools work by hashing files against a known-bad database (YARA, ClamAV, ETs). They miss anything that's not in their database — and the database is always behind.
+
+**minertop is behavioral.** It doesn't care what the file on disk looks like. It watches what the process *does* at the kernel boundary:
+
+1. **Does it talk to a known mining pool port?** Stratum on `14444` (Monero), `2020` (Ethereum), the NiceHash range, etc. — a curated database lives in `render.js` (~30 entries) and the kernel just reports the destination port. No payload inspection, no DPI.
+2. **Is it lying about its identity?** Real kernel threads (`kworker/*`, `ksoftirqd`, `swapper`) physically cannot open outbound TCP. So if a process named like one is sending bytes to a mining pool, that's not coincidence — that's a spoofed `prctl(PR_SET_NAME, "kworker/u4:2")` call from malware trying to hide in `ps`.
+
+Result: a miner running under a brand-new SHA256 still trips the detector because the *behavior* hasn't changed, just the file. The detection rules are 50 lines of JavaScript you can read in two minutes.
+
+## How to verify it works — run the simulator
+
+The repo ships a working attack simulator at `tests/simulate_attack.sh`. It launches a fake mining pool on `127.0.0.1:14444` and a Python process that renames itself to `kworker/u4:2` (using the same `prctl(PR_SET_NAME)` syscall real malware uses) and then sends Stratum-shaped traffic in a loop.
+
+```sh
+# In one shell — start minertop's audit
+yeet run main.js -- --audit --duration 20
+
+# In another shell — fire the simulated attack
+./tests/simulate_attack.sh
+```
+
+After 20 seconds, the audit will print:
+
+```
+VERDICT: CRITICAL — hidden cryptominer detected
+  1 process(es) talking to mining pools while spoofing kernel-thread names.
+```
+
+Stop the simulator with `Ctrl-C`. You've now verified the detection works on your box, without ever installing real malware.
+
+## Audit mode (one-shot scan)
+
+The default mode for "is this server compromised right now?" workflows. Runs for a fixed window, watches every outbound TCP connection, and prints a verdict + supporting evidence to stdout. Safe to redirect, pipe through `tee`, or paste in a ticket.
+
+```sh
+# 60-second scan (default)
+yeet run main.js -- --audit
+
+# Longer scan (90 seconds — useful for fleets where some miners are bursty)
+yeet run main.js -- --audit --duration 90
+
+# Machine-readable for scripting / dashboards
+yeet run main.js -- --audit --duration 60 --json | tee scan-$(hostname).json
+```
+
+Sample clean output:
+
+```
+════════════════════════════════════════════════════════════════
+  minertop audit · behavioral hidden-cryptominer scan
+════════════════════════════════════════════════════════════════
+
+  Scan started: 2026-05-31T14:18:01.234Z
+  Scan ended:   2026-05-31 14:19:01 UTC
+  Duration:     1m 0s
+
+── Connections observed ────────────────────────────────────────
+  TCP events seen:          847
+  Connections opened:       42
+  Connections closed:       39
+  Distinct destinations:    18
+  Total bytes ↑/↓:          12MB / 38MB
+
+── Mining pool detection ───────────────────────────────────────
+  High-confidence mining ports:  0
+  Likely Stratum ports:          0
+  Crypto P2P ports (BTC/ETH):    0  (informational, not mining)
+  Mining traffic ↑/↓:            0B / 0B
+  Overall:                       ✓ NONE
+
+── Comm-name mimicry detection ─────────────────────────────────
+  Kernel-thread name spoofing:   0
+  System-daemon name spoofing:   0
+  Overall:                       ✓ NO MIMICRY OBSERVED
+
+── Top destinations by bandwidth ───────────────────────────────
+   1. 140.82.114.4:443
+      ↑3.2MB / ↓18MB    conns: 12
+   2. 151.101.1.5:443
+      ↑1.8MB / ↓8MB     conns: 8
+
+════════════════════════════════════════════════════════════════
+VERDICT: NO MINING ACTIVITY DETECTED
+  No connections to known mining pools or Stratum-class ports.
+  No processes mimicking kernel-thread names with outbound TCP.
+════════════════════════════════════════════════════════════════
+```
+
+## Live mode (dashboard)
+
+For watching activity in real time. Repaints every 200 ms.
+
+```sh
+yeet run main.js
+```
+
+The dashboard:
 
 ```
  ▌ MINERTOP · crypto-mining traffic detector ────────────────────────────────────────────────────────────────────
@@ -41,34 +137,40 @@ It's built on [**yeet**](https://yeet.cx), a Linux runtime that makes a kernel-s
 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
-Top to bottom:
+**HIDDEN MINER ALERTS** — only shown when alerts exist. Two tiers:
+- `CRITICAL` — process name matches a kernel-thread prefix. Kernel threads can't open outbound TCP. If you see this, it's malware.
+- `suspicious` — process name matches a common system-daemon prefix. These *can* legitimately have network connections but should not be mining.
 
-A **header strip** with live system rates, the share of current bytes flowing on known mining ports, and a count of hidden-miner alerts. When that last cell goes red, attention.
+**MINING ACTIVITY** — every process talking to a mining pool, sorted with mimicry hits at the top.
 
-A **HIDDEN MINER ALERTS** panel — only shown when alerts exist. Lists every process whose `comm` is mimicking a kernel thread or system daemon while talking to a mining pool. Two tiers:
-- `CRITICAL` — process name matches a kernel-thread prefix (`kworker`, `ksoftirqd`, `swapper`, …). Kernel threads can't open outbound TCP. If you see this, it's malware.
-- `suspicious` — process name matches a common system-daemon prefix (`systemd`, `dbus`, `cron`, …). These *can* legitimately have network connections but should not be mining.
+**POOLS** — destination pools currently active, with coin and protocol inferred from the port.
 
-A **MINING ACTIVITY** panel — every process talking to a mining pool, sorted with mimicry hits at the top. Glyph tells you the threat level at a glance: `⛏!` red for kernel-thread mimicry, `⛏?` orange for daemon mimicry, `⛏` for a process whose name doesn't look like an obvious lie (a known miner, or a custom-named one — could still be malware, just less obvious).
+**CONNECTION FEED** — every open and close, mining-highlighted.
 
-A **POOLS** panel — destination pools currently active, with the coin and protocol inferred from the port. Monero on `14444`, Ethereum on `2020`, NiceHash on `9200/9201`, Ravencoin on `12222`, and the generic Stratum ports (`3333/4444/5555/7777/8888/9999`) on which "we know it's Stratum, we just can't tell the coin."
-
-A **CONNECTION FEED** — every open and close, mining-highlighted.
-
-## Quick start
+For a shareable screenshot, anonymize identifying details:
 
 ```sh
-curl -fsSL https://yeet.cx | sh
-yeet run https://github.com/ibrahimmian36/minertop
+yeet run main.js -- --anonymize
 ```
 
-For a shareable screenshot, anonymize process names and remote addresses (everything identifying gets relabeled `proc-01`, `host-02`, …):
+## Limitations & evasion paths
 
-```sh
-yeet run https://github.com/ibrahimmian36/minertop -- --anonymize
-```
+minertop is honest about what it catches and what it doesn't. Anyone designing around it should know these:
 
-Runs until `Ctrl-C`. Resize the terminal and the layout reflows; minimum 80×28.
+- **Custom mining pools on non-standard ports.** The port database covers public-pool defaults (NiceHash, 2miners, Ethermine, Monero defaults, etc.). A private pool running on port `443` looks like HTTPS traffic to minertop. The mitigation: pair with egresstop-style allowlist enforcement so unauthorized destinations are flagged independently.
+- **Non-spoofed process names.** If the miner names itself `nginx-worker`, `nodejs`, or `chrome-helper`, the mimicry detector won't fire. The MINING ACTIVITY panel still surfaces the connection — it just doesn't promote it to a CRITICAL alert. Sophisticated attackers blend in; lazy ones (which is most cryptojacking malware) hide as kernel threads. minertop catches the lazy ones loudly and the sophisticated ones quietly.
+- **Stratum over TLS on standard ports.** Some pools offer `stratum+ssl://`. If routed to a non-default port from the database, missed. If routed to `443`, missed (looks like HTTPS).
+- **Theoretical: BPF-resident mining.** A maximally evasive miner could run *inside* an eBPF program itself, never touching the user-process syscall surface. This is exotic and not seen in the wild, but it's a real category. Defense against this would be checking which BPF programs are loaded — out of scope for minertop.
+- **Connection-before-start blindness.** Connections opened before minertop launches are invisible until they next transition state. The audit window catches everything for its duration, but a long-lived miner that established its socket hours ago and rarely re-opens won't trigger an OPEN event during the scan. The BYTES path still catches active traffic, so any miner currently moving data is detected.
+- **Process attribution edge cases.** TCP state transitions can fire from softirq context where the current task is `swapper` or a `kworker`. minertop refuses those as the real owner and waits for `tcp_sendmsg`/`tcp_cleanup_rbuf` in app context to fix attribution. Converges within microseconds for any process actually moving data.
+
+## Real-world incidents this is designed for
+
+- **[Kinsing](https://en.wikipedia.org/wiki/Kinsing)** — Linux cryptojacker family active 2020-present. Spreads through misconfigured Docker / Redis / SaltStack instances. Renames itself to look like a kernel thread. Detected by minertop's CRITICAL mimicry tier on first outbound Stratum byte.
+- **TeamTNT** — campaigns 2020-2022 targeting cloud Linux hosts, installing XMRig-based miners disguised as system processes.
+- **Sysrv-hello** — Go-based mining worm, also masquerades as system daemons.
+
+The common thread: outbound to public mining pools + process-name camouflage. minertop is a focused detector for exactly that pattern.
 
 ## What's under the hood
 
@@ -80,18 +182,15 @@ Three BPF programs feed one ring buffer:
 | `on_sendmsg`       | `fentry/tcp_sendmsg`            | count tx bytes; fix pid to the real sender (app ctx)        |
 | `on_cleanup_rbuf`  | `fentry/tcp_cleanup_rbuf`       | count rx bytes; fix pid to the real receiver (app ctx)      |
 
-One `HASH` map (`conns`, keyed by sock pointer) stores per-connection state and cumulative byte counts. One `RINGBUF` (256 KiB) carries three event kinds to JS:
+One `HASH` map (`conns`, keyed by sock pointer) stores per-connection state and cumulative byte counts. One `RINGBUF` (256 KiB) carries three event kinds to JS: `OPEN`, `BYTES` (delta every 64 KiB), `CLOSE`. The kernel side is CO-RE — uses libbpf BTF relocations, no fixed offsets, portable across kernel versions.
 
-- `OPEN` — new connection observed, after we know who owns it
-- `BYTES` — periodic delta, emitted every 64 KiB transferred in either direction
-- `CLOSE` — connection ending, with the final cumulative byte counts
+All mining-specific intelligence (port database, mimicry detection, alert ranking, verdict logic) lives in JavaScript. A new mining-pool port shows up in a one-line patch to `render.js` rather than a kernel reload.
 
-The kernel side is **identical to bytetop's** — same CO-RE-compliant hooks, same map shapes, same event format. The mining-specific intelligence (port database, mimicry detection, alert ranking) lives in JavaScript, which means a new mining pool port shows up in a 10-line patch to `render.js` rather than a kernel reload.
-
-- `main.js` — entry: tty size, render loop, BPF bind/subscribe
+- `main.js` — entry: dispatches between live mode and audit mode, BPF bind/subscribe
 - `state.js` — connection model + mining-aware aggregators + hidden-miner detection
+- `audit.js` — one-shot scan logic + report formatting (human + JSON)
 - `render.js` — ANSI, color ramps, byte/port formatters, **the mining pool port database**
-- `dashboard.js` — panels + layout (`renderDashboard`)
+- `dashboard.js` — panels + layout (`renderDashboard`) for live mode
 
 ## Requirements
 
@@ -110,34 +209,6 @@ yeet run main.js        # run from source
 ```
 
 `make clean` removes `bin/`. `make distclean` also removes the generated `include/vmlinux.h`.
-
-## How the detection actually works
-
-**Port classification.** Every TCP destination port is matched against three sets:
-
-- **High-confidence mining ports** (`14444`, `14433`, `18080`, NiceHash `3357/3858/9200/9201`, Ethermine `12020/12021`, Ravencoin `12222`). A connection to one of these is almost certainly mining.
-- **Likely-mining Stratum ports** (`3333`, `4444`, `5555`, `7777`, `8888`, `9999`, `11111`, `2020`, `2021`, `8008`, `9000`, `5588`). Mining is the dominant use of these ports but they're not exclusive — a generic JSON-RPC service could plausibly land on `5555`.
-- **Crypto P2P ports** (`8333` Bitcoin, `18333` testnet, `9333` Litecoin, `30303` Ethereum, `8233` Zcash, `22556` Dogecoin, `8767` Ravencoin). Not mining itself; running a full node. Surfaced informationally.
-
-**Mimicry detection.** Process `comm` is checked against two prefix lists. Any match while the process is talking mining promotes the connection to an alert:
-
-- `KERNEL_THREAD_PREFIXES` = `kworker`, `ksoftirqd`, `swapper`, `kthreadd`, `migration`, `rcu_`, `watchdog`, `idle_inject`, `writeback`, `kintegrityd`, `khungtaskd`, `kcompactd`, `kblockd`, `khugepaged`, `kthrotld`, `kswapd`, `kdevtmpfs`, `netns`, `irq/`, `ipv6_addrconf` → **critical**
-- `SYSTEM_DAEMON_PREFIXES` = `systemd`, `dbus`, `cron`, `agetty`, `logind`, `rsyslogd`, `sshd`, `init`, `atd`, `udevd` → **suspicious**
-
-## Caveats
-
-- **Port heuristics are heuristics.** A mining pool reachable only on a non-standard port (say, port `1234`) won't be classified as mining. Conversely, a legitimate JSON-RPC service on port `5555` would be flagged. The classification is conservative on the high-confidence list and liberal on the likely-mining list; the dashboard distinguishes the two visually.
-- **Mimicry detection only catches comm-spoofing.** Sophisticated malware can pick a process name that doesn't match either prefix list (`chrome-helper`, `node`, anything else). minertop will still surface the mining traffic — it just won't promote it to an alert. The mimicry detection catches the lazy attackers; the mining-activity panel catches everyone.
-- **Process attribution is best-effort.** Same model as `bytetop`. TCP state transitions can fire from softirq context where `current` is `swapper` or a `kworker`. We refuse those as the real owner and let `tcp_sendmsg` / `tcp_cleanup_rbuf` (always app context) update us with the true PID. Attribution converges within microseconds for any process that actually does I/O.
-- **Connections created before minertop starts are invisible** until they next transition state. No kernel walk on startup.
-- **Ringbuf overflow drops events under extreme load.** The 256 KiB ringbuf can hold roughly 2 k threshold-emitted events; sustained tens of thousands of byte-emissions per second can drop. Mining traffic is sparse by nature so this is rarely an issue for the target use case.
-- **TCP only.** Stratum and most P2P crypto protocols run on TCP. UDP-based mining (rare) won't be tracked.
-
-## Differences from sibling tools
-
-- **vs `bytetop`** — same BPF surface, but `bytetop` is system-wide byte accounting with no mining lens. `minertop` is a security tool that happens to use the same kernel hooks.
-- **vs `httpsnoop`** — `httpsnoop` is a generic HTTP request snooper. `minertop` doesn't read TCP payloads at all — it classifies by destination port and process attribution. Lower kernel risk, narrower scope, different question.
-- **vs Falco / commercial agents** — those are full-stack security platforms with signature databases, agents, and centralized alerting. `minertop` is one terminal window that gives you the answer right now, on this box, with no infrastructure.
 
 ---
 
